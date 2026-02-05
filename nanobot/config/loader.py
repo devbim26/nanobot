@@ -32,7 +32,10 @@ def load_config(config_path: Path | None = None) -> Config:
     
     if path.exists():
         try:
-            with open(path) as f:
+            # Windows tools (especially Windows PowerShell 5) often save UTF-8
+            # JSON with BOM. Under `python -X utf8` this breaks `json.load()`
+            # unless we read via `utf-8-sig`.
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
             return Config.model_validate(convert_keys(data))
         except (json.JSONDecodeError, ValueError) as e:
@@ -57,7 +60,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     data = config.model_dump()
     data = convert_to_camel(data)
     
-    with open(path, "w") as f:
+    # Write without BOM to keep config readable everywhere.
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
