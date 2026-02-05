@@ -3,7 +3,8 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from nanobot.agent.memory import MemoryStore
+from nanobot.config.schema import ExecToolConfig
 
 from loguru import logger
 
@@ -12,7 +13,12 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
+from nanobot.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
@@ -41,9 +47,8 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 20,
         brave_api_key: str | None = None,
-        exec_config: "ExecToolConfig | None" = None,
+        exec_config: ExecToolConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
@@ -128,7 +133,9 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
     
-    async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+    async def _process_message(
+        self, msg: InboundMessage
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
         
@@ -147,6 +154,141 @@ class AgentLoop:
         
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
+
+        # ------------------------------------------------------------------
+        # Telegram reply-keyboard "buttons" are just text messages.
+        # We implement a small state machine for saving the full dialog into
+        # long-term memory (memory/MEMORY.md) with user confirmation.
+        # ------------------------------------------------------------------
+        normalized = (msg.content or "").strip().lower()
+        is_save_memory = normalized in {"сохранить в памяти", "save to memory"}
+        is_cancel_memory = normalized in {"отмена", "cancel"}
+        is_confirm_save = normalized in {"сохранить", "save"}
+
+        awaiting = bool(session.metadata.get("awaiting_memory_confirm"))
+        if awaiting and is_cancel_memory:
+            session.metadata.pop("awaiting_memory_confirm", None)
+            session.metadata.pop("memory_draft", None)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Ок, отменил сохранение. Черновик сброшен.",
+            )
+
+        if awaiting and (is_confirm_save or is_save_memory):
+            draft = str(session.metadata.get("memory_draft") or "").strip()
+            if not draft:
+                session.metadata.pop("awaiting_memory_confirm", None)
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        "Черновик не найден. Нажми «Сохранить в памяти» "
+                        "ещё раз, чтобы сформировать новый черновик."
+                    ),
+                )
+
+            MemoryStore(self.workspace).append_long_term(draft)
+            session.metadata.pop("awaiting_memory_confirm", None)
+            session.metadata.pop("memory_draft", None)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Сохранено в долгосрочную память (memory/MEMORY.md).",
+            )
+
+        if awaiting and not (
+            is_confirm_save or is_save_memory or is_cancel_memory
+        ):
+            # Treat any text as an edited draft.
+            edited = (msg.content or "").strip()
+            if edited:
+                session.metadata["memory_draft"] = edited
+                self.sessions.save(session)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        "Обновил черновик.\n\n"
+                        f"{edited}\n\n"
+                        "Теперь напиши «сохранить», нажми\n"
+                        "«Сохранить в памяти» ещё раз, или нажми «Отмена»."
+                    ),
+                )
+
+        if is_save_memory and not awaiting:
+            # Build a transcript from the whole session (user + assistant).
+            transcript_lines: list[str] = []
+            for m in session.messages:
+                role = m.get("role", "")
+                content = (m.get("content") or "").strip()
+                if not content:
+                    continue
+                if role == "user":
+                    transcript_lines.append(f"Пользователь: {content}")
+                elif role == "assistant":
+                    transcript_lines.append(f"Ассистент: {content}")
+                else:
+                    transcript_lines.append(f"{role}: {content}")
+
+            transcript = "\n".join(transcript_lines)
+            if not transcript.strip():
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Пока нечего сохранять: история диалога пуста.",
+                )
+
+            # Ask the LLM to draft a structured memory note.
+            memory_prompt = (
+                "Сформируй краткое структурированное резюме всего диалога для "
+                "долгосрочной памяти. Требования:\n"
+                "- Пиши по-русски\n"
+                "- Только то, что действительно важно помнить\n"
+                "- Структура Markdown: Заголовок, затем блоки: 'Факты', "
+                "'Предпочтения', 'Контекст проекта', "
+                "'Решения/договорённости', "
+                "'Следующие шаги'\n"
+                "- Если раздел пустой — пропусти его\n\n"
+                "Диалог:\n"
+                f"{transcript}"
+            )
+
+            draft_resp = await self.provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты — ассистент, который готовит заметки в память."
+                        ),
+                    },
+                    {"role": "user", "content": memory_prompt},
+                ],
+                tools=None,
+                model=self.model,
+            )
+
+            draft = (draft_resp.content or "").strip()
+            if not draft:
+                draft = "(Не удалось сгенерировать черновик резюме.)"
+
+            session.metadata["awaiting_memory_confirm"] = True
+            session.metadata["memory_draft"] = draft
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Черновик резюме для памяти:\n\n"
+                    f"{draft}\n\n"
+                    "Отправь правки текстом, или напиши «сохранить», "
+                    "или нажми «Сохранить в памяти» ещё раз. "
+                    "Чтобы отменить — нажми «Отмена»."
+                ),
+            )
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -187,7 +329,8 @@ class AgentLoop:
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
+                            # Must be JSON string
+                            "arguments": json.dumps(tc.arguments),
                         }
                     }
                     for tc in response.tool_calls
@@ -199,8 +342,13 @@ class AgentLoop:
                 # Execute tools
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    logger.debug(
+                        "Executing tool: "
+                        f"{tool_call.name} with arguments: {args_str}"
+                    )
+                    result = await self.tools.execute(
+                        tool_call.name, tool_call.arguments
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -210,7 +358,9 @@ class AgentLoop:
                 break
         
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            final_content = (
+                "I've completed processing but have no response to give."
+            )
         
         # Save to session
         session.add_message("user", msg.content)
@@ -223,7 +373,9 @@ class AgentLoop:
             content=final_content
         )
     
-    async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
+    async def _process_system_message(
+        self, msg: InboundMessage
+    ) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
         
@@ -292,8 +444,13 @@ class AgentLoop:
                 
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    logger.debug(
+                        "Executing tool: "
+                        f"{tool_call.name} with arguments: {args_str}"
+                    )
+                    result = await self.tools.execute(
+                        tool_call.name, tool_call.arguments
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -315,7 +472,9 @@ class AgentLoop:
             content=final_content
         )
     
-    async def process_direct(self, content: str, session_key: str = "cli:direct") -> str:
+    async def process_direct(
+        self, content: str, session_key: str = "cli:direct"
+    ) -> str:
         """
         Process a message directly (for CLI usage).
         

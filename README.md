@@ -205,6 +205,17 @@ Talk to your nanobot through Telegram, WhatsApp, or Feishu — anytime, anywhere
 nanobot gateway
 ```
 
+### Telegram buttons
+
+The Telegram bot uses a reply keyboard with quick actions.
+
+- **Очистить контекст**: clears the conversation session for this chat.
+- **Сохранить в памяти**: drafts a structured summary of the **whole dialog** and asks for confirmation.
+  - You can edit the draft by sending a message (it replaces the draft).
+  - Send **"сохранить"** or press **"Сохранить в памяти"** again to write it into
+    `memory/MEMORY.md` in the configured workspace.
+- **Отмена**: cancels the save-to-memory flow and clears the draft.
+
 </details>
 
 <details>

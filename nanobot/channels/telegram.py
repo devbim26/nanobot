@@ -22,6 +22,8 @@ from nanobot.session.manager import SessionManager
 
 
 BUTTON_CLEAR_CONTEXT = "Очистить контекст"
+BUTTON_SAVE_MEMORY = "Сохранить в памяти"
+BUTTON_CANCEL_MEMORY = "Отмена"
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -106,7 +108,14 @@ class TelegramChannel(BaseChannel):
         self._sessions = SessionManager(Path.cwd())
 
     def _get_reply_keyboard(self) -> ReplyKeyboardMarkup:
-        keyboard = [[KeyboardButton(BUTTON_CLEAR_CONTEXT)]]
+        # Reply keyboard (not inline): buttons send their text as a normal message.
+        # We only intercept "Очистить контекст" locally; the other buttons go through
+        # the agent via the generic handler.
+        keyboard = [[
+            KeyboardButton(BUTTON_CLEAR_CONTEXT),
+            KeyboardButton(BUTTON_SAVE_MEMORY),
+            KeyboardButton(BUTTON_CANCEL_MEMORY),
+        ]]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     async def start(self) -> None:

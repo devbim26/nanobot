@@ -10,7 +10,8 @@ class MemoryStore:
     """
     Memory system for the agent.
     
-    Supports daily notes (memory/YYYY-MM-DD.md) and long-term memory (MEMORY.md).
+    Supports daily notes (memory/YYYY-MM-DD.md) and long-term memory
+    (MEMORY.md).
     """
     
     def __init__(self, workspace: Path):
@@ -52,6 +53,54 @@ class MemoryStore:
     def write_long_term(self, content: str) -> None:
         """Write to long-term memory (MEMORY.md)."""
         self.memory_file.write_text(content, encoding="utf-8")
+
+    def ensure_long_term_exists(self) -> None:
+        """Ensure long-term memory file exists with a minimal template."""
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        if self.memory_file.exists():
+            return
+        self.memory_file.write_text(
+            """# Long-term Memory
+
+This file stores important information that should persist across sessions.
+
+## User Information
+
+(Important facts about the user)
+
+## Preferences
+
+(User preferences learned over time)
+
+## Project Context
+
+(Information about ongoing projects)
+
+## Important Notes
+
+(Things to remember)
+
+---
+
+*This file is automatically updated by nanobot when important information
+should be remembered.*
+""",
+            encoding="utf-8",
+        )
+
+    def append_long_term(self, content: str) -> None:
+        """Append a new entry to long-term memory without overwriting."""
+        entry = (content or "").strip()
+        if not entry:
+            return
+
+        self.ensure_long_term_exists()
+
+        # Always separate entries cleanly.
+        with open(self.memory_file, "a", encoding="utf-8") as f:
+            f.write("\n\n---\n\n")
+            f.write(entry)
+            f.write("\n")
     
     def get_recent_memories(self, days: int = 7) -> str:
         """
