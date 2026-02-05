@@ -2,15 +2,26 @@
 
 import asyncio
 import re
+from pathlib import Path
 
 from loguru import logger
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+from nanobot.session.manager import SessionManager
+
+
+BUTTON_CLEAR_CONTEXT = "Очистить контекст"
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -91,6 +102,12 @@ class TelegramChannel(BaseChannel):
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
+        # SessionManager сохраняет историю в ~/.nanobot/sessions, workspace тут не критичен.
+        self._sessions = SessionManager(Path.cwd())
+
+    def _get_reply_keyboard(self) -> ReplyKeyboardMarkup:
+        keyboard = [[KeyboardButton(BUTTON_CLEAR_CONTEXT)]]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -107,18 +124,32 @@ class TelegramChannel(BaseChannel):
             .build()
         )
         
-        # Add message handler for text, photos, voice, documents
+        # Handlers order matters: "Очистить контекст" must be processed BEFORE
+        # the generic message handler.
+        self._app.add_handler(CommandHandler("start", self._on_start), group=0)
         self._app.add_handler(
             MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL) 
-                & ~filters.COMMAND, 
-                self._on_message
-            )
+                filters.Regex(rf"^{re.escape(BUTTON_CLEAR_CONTEXT)}$"),
+                self._on_clear_context,
+            ),
+            group=0,
         )
-        
-        # Add /start command handler
-        from telegram.ext import CommandHandler
-        self._app.add_handler(CommandHandler("start", self._on_start))
+
+        # Generic handler for text, photos, voice, documents
+        self._app.add_handler(
+            MessageHandler(
+                (
+                    filters.TEXT
+                    | filters.PHOTO
+                    | filters.VOICE
+                    | filters.AUDIO
+                    | filters.Document.ALL
+                )
+                & ~filters.COMMAND,
+                self._on_message,
+            ),
+            group=1,
+        )
         
         logger.info("Starting Telegram bot (polling mode)...")
         
@@ -165,7 +196,8 @@ class TelegramChannel(BaseChannel):
             await self._app.bot.send_message(
                 chat_id=chat_id,
                 text=html_content,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=self._get_reply_keyboard(),
             )
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
@@ -175,7 +207,8 @@ class TelegramChannel(BaseChannel):
             try:
                 await self._app.bot.send_message(
                     chat_id=int(msg.chat_id),
-                    text=msg.content
+                    text=msg.content,
+                    reply_markup=self._get_reply_keyboard(),
                 )
             except Exception as e2:
                 logger.error(f"Error sending Telegram message: {e2}")
@@ -186,9 +219,30 @@ class TelegramChannel(BaseChannel):
             return
         
         user = update.effective_user
+        reply_markup = self._get_reply_keyboard()
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!"
+            "Send me a message and I'll respond!",
+            reply_markup=reply_markup
+        )
+
+    async def _on_clear_context(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Clear conversation context for this chat/session."""
+        if not update.message:
+            return
+
+        chat_id = update.message.chat_id
+        session_key = f"{self.name}:{chat_id}"
+
+        session = self._sessions.get_or_create(session_key)
+        session.clear()
+        self._sessions.save(session)
+
+        await update.message.reply_text(
+            "Контекст диалога очищен.",
+            reply_markup=self._get_reply_keyboard(),
         )
     
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
